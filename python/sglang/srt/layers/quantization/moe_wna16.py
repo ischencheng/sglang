@@ -402,10 +402,6 @@ class MoeWNA16Method(FusedMoEMethodBase):
         layer: torch.nn.Module,
         dispatch_output: StandardDispatchOutput,
     ) -> CombineInput:
-        assert self.moe_runner_config.activation == "silu", (
-            "Only SiLU activation is supported."
-        )
-
         quant_info = self.get_triton_quant_info(layer)
         return self.runner.run(dispatch_output, quant_info)
 

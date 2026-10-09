@@ -3,6 +3,7 @@ import unittest
 from typing import Optional
 
 import torch
+import torch.nn.functional as F
 from sgl_kernel.scalar_type import scalar_types
 
 from sglang.srt.layers.activation import SiluAndMul
@@ -32,6 +33,7 @@ def torch_experts(
     expert_map: Optional[torch.Tensor] = None,
     quant_dtype: Optional[torch.dtype] = None,
     apply_router_weights_on_input: bool = False,
+    activation: str = "silu",
 ) -> torch.Tensor:
     assert (
         global_num_experts == -1
@@ -63,7 +65,12 @@ def torch_experts(
         if mask.sum():
             if quant_dtype is None:
                 tmp1 = a[mask] @ w1[i].transpose(0, 1)
-                tmp2 = SiluAndMul()(tmp1)
+                if activation == "silu":
+                    tmp2 = SiluAndMul()(tmp1)
+                else:
+                    gate, up = tmp1.chunk(2, dim=-1)
+                    approximate = "tanh" if activation == "gelu_tanh" else "none"
+                    tmp2 = F.gelu(gate, approximate=approximate) * up
                 out[mask] = tmp2 @ w2[i].transpose(0, 1)
 
     if apply_router_weights_on_input:
@@ -84,11 +91,19 @@ def torch_moe(
     topk: int,
     global_num_experts: int = -1,
     expert_map: Optional[torch.Tensor] = None,
+    activation: str = "silu",
 ) -> torch.Tensor:
     score = torch.softmax(score, dim=-1, dtype=torch.float32)
     topk_weight, topk_ids = torch.topk(score, topk)
     return torch_experts(
-        a, w1, w2, topk_weight, topk_ids, global_num_experts, expert_map
+        a,
+        w1,
+        w2,
+        topk_weight,
+        topk_ids,
+        global_num_experts,
+        expert_map,
+        activation=activation,
     )
 
 
@@ -321,6 +336,69 @@ class TestFusedMarlinMoe(CustomTestCase):
                     is_k_full=is_k_full,
                 )
 
+                torch.testing.assert_close(
+                    marlin_output, torch_output, atol=5e-2, rtol=0
+                )
+
+    def test_fused_marlin_moe_gelu(self):
+        """Gated GELU experts (Gemma 4 MoE) must run as GELU, not fail or fall back to SiLU."""
+        m, n, k, e, topk, group_size = 123, 1024, 2048, 12, 3, 128
+        quant_type = scalar_types.uint4b8
+        torch.manual_seed(0)
+        a = torch.randn((m, k), device="cuda", dtype=torch.bfloat16) / 10
+        w1 = torch.randn((e, 2 * n, k), device="cuda", dtype=torch.bfloat16) / 20
+        w2 = torch.randn((e, k, n), device="cuda", dtype=torch.bfloat16) / 20
+
+        def quantize(w, size_k):
+            refs, qweights, scales = [], [], []
+            for i in range(w.shape[0]):
+                w_ref, qweight, scale, _, _, _ = marlin_quantize(
+                    w[i].transpose(1, 0),
+                    quant_type,
+                    group_size,
+                    False,
+                    torch.randperm(size_k),
+                )
+                refs.append(w_ref.T)
+                qweights.append(qweight)
+                scales.append(scale)
+            return (
+                stack_and_dev(refs),
+                stack_and_dev(qweights).contiguous(),
+                stack_and_dev(scales),
+            )
+
+        w_ref1, qweight1, scales1 = quantize(w1, k)
+        w_ref2, qweight2, scales2 = quantize(w2, n)
+        score = torch.randn((m, e), device="cuda", dtype=torch.bfloat16)
+        from sglang.srt.layers.moe.topk import fused_topk_torch_native
+
+        topk_weights, topk_ids = fused_topk_torch_native(a, score, topk, False)
+
+        for activation in ("gelu", "gelu_tanh"):
+            with self.subTest(activation=activation):
+                torch_output = torch_moe(
+                    a,
+                    w_ref1,
+                    w_ref2,
+                    score,
+                    topk,
+                    global_num_experts=e,
+                    activation=activation,
+                )
+                marlin_output = fused_marlin_moe(
+                    a,
+                    qweight1,
+                    qweight2,
+                    scales1,
+                    scales2,
+                    score,
+                    topk_weights,
+                    topk_ids,
+                    global_num_experts=e,
+                    num_bits=4,
+                    activation=activation,
+                )
                 torch.testing.assert_close(
                     marlin_output, torch_output, atol=5e-2, rtol=0
                 )
