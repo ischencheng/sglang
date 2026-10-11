@@ -2553,6 +2553,7 @@ def is_hybrid_swa_model(
         "EmbeddingGemma2Model",
         "Gemma4UnifiedForConditionalGeneration",
         "DiffusionGemmaForBlockDiffusion",
+        "Kolibri1ForCausalLM",
         "LagunaForCausalLM",
         "MellumForCausalLM",
         "MuseGlimmerForCausalLM",
@@ -2635,6 +2636,7 @@ def get_hybrid_layer_ids(
         or "EmbeddingGemma2Model" in model_architectures
         or "Gemma4UnifiedForConditionalGeneration" in model_architectures
         or "DiffusionGemmaForBlockDiffusion" in model_architectures
+        or "Kolibri1ForCausalLM" in model_architectures
         or "LagunaForCausalLM" in model_architectures
         or "MellumForCausalLM" in model_architectures
         or "MuseGlimmerForCausalLM" in model_architectures

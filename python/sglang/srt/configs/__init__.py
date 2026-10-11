@@ -46,6 +46,7 @@ from sglang.srt.configs.kimi_k25 import KimiK25Config
 from sglang.srt.configs.kimi_linear import KimiLinearConfig
 from sglang.srt.configs.kimi_vl import KimiVLConfig
 from sglang.srt.configs.kimi_vl_moonvit import MoonViTConfig
+from sglang.srt.configs.kolibri1 import Kolibri1Config
 from sglang.srt.configs.laguna import LagunaConfig
 from sglang.srt.configs.lfm2 import Lfm2Config
 from sglang.srt.configs.lfm2_moe import Lfm2MoeConfig
@@ -120,6 +121,7 @@ __all__ = [
     "KimiLinearConfig",
     "KimiK3Config",
     "KimiK25Config",
+    "Kolibri1Config",
     "LagunaConfig",
     "Qwen3NextConfig",
     "Qwen4ExpConfig",

@@ -42,6 +42,7 @@ class TestHybridLayerIds(CustomTestCase):
         for architecture in (
             "Gemma4ForCausalLM",
             "Gemma4ForConditionalGeneration",
+            "Kolibri1ForCausalLM",
             "LagunaForCausalLM",
             "MellumForCausalLM",
         ):
