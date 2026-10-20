@@ -91,7 +91,7 @@ def _boundary(post_input_scale, hidden):
 
 
 @pytest.mark.parametrize("backend", _BACKENDS)
-@pytest.mark.parametrize("num_tokens", [1, 7, 300])
+@pytest.mark.parametrize("num_tokens", [1, 7, 32, 300])
 @pytest.mark.parametrize("post_input_scale", [False, True])
 @pytest.mark.parametrize("router_dtype", [None, torch.float32])
 def test_norm_residual_matches_native(

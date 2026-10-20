@@ -36,6 +36,9 @@ _CLUSTER_SIZES = (1, 2, 4, 8, 16)
 # by 0.3-0.5 us per call at M<=32.
 _SMALL_M = 192
 _SMALL_M_THREAD_CHOICES = (256, 512, 1024, 128)
+# Hopper runs the cluster kernel too. Measured on H200 / hidden_size 8192, it
+# beats the one-CTA kernel up to 32 rows and loses from 64 rows.
+_SM90_CLUSTER_MAX_TOKENS = 32
 
 
 def _launch_config(hidden_size: int, num_tokens: int) -> tuple[int, bool]:
@@ -81,6 +84,15 @@ def _cluster_size_for_shape(hidden_size: int, num_tokens: int) -> int:
     while cluster_size > 1 and _cluster_num_threads(hidden_size, cluster_size) is None:
         cluster_size //= 2
     return cluster_size
+
+
+def _auto_cluster_size(hidden_size: int, num_tokens: int, device: torch.device) -> int:
+    capability = torch.cuda.get_device_capability(device)
+    if capability[0] >= 10 or (
+        capability == (9, 0) and num_tokens <= _SM90_CLUSTER_MAX_TOKENS
+    ):
+        return _cluster_size_for_shape(hidden_size, num_tokens)
+    return 1
 
 
 def norm_residual_launch_config(
@@ -184,11 +196,8 @@ def fused_norm_residual(
 
     auto_cluster = cluster_size is None
     if auto_cluster:
-        supports_clusters = torch.cuda.get_device_capability(branch.device)[0] >= 10
         cluster_size = (
-            _cluster_size_for_shape(hidden_size, m)
-            if supports_clusters and not pre_norm_bf16
-            else 1
+            1 if pre_norm_bf16 else _auto_cluster_size(hidden_size, m, branch.device)
         )
 
     assert cluster_size is not None
