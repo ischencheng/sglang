@@ -797,5 +797,179 @@ def test_nvfp4_reload_preserves_layer_and_prepared_weight_storage(
         assert layer._flashinfer_megamoe_input_norm_const == 1.0
 
 
+def _fp4_expert_layer(*, apply_router_weight_on_input=False):
+    hidden, intermediate, experts = 128, 128, 2
+    return types.SimpleNamespace(
+        layer_id=0,
+        hidden_size=hidden,
+        num_experts=experts,
+        moe_ep_size=1,
+        moe_ep_rank=0,
+        intermediate_size_per_partition=intermediate,
+        top_k=2,
+        moe_runner_config=types.SimpleNamespace(
+            is_gated=True,
+            activation="silu",
+            swiglu_limit=10.0,
+            apply_router_weight_on_input=apply_router_weight_on_input,
+        ),
+        w13_weight=torch.zeros(experts, 2 * intermediate, hidden // 2, dtype=torch.int8),
+        w2_weight=torch.zeros(experts, hidden, intermediate // 2, dtype=torch.int8),
+        w13_weight_scale_inv=torch.full((experts, 2 * intermediate, hidden // 32), 0.5),
+        w2_weight_scale_inv=torch.full((experts, hidden, intermediate // 32), 4.0),
+    )
+
+
+def _install_fp4_megamoe_fakes(monkeypatch, module, *, is_sm90, enable_eplb=False):
+    from dataclasses import dataclass
+
+    runtime_context = sys.modules["sglang.srt.runtime_context"]
+    runtime_context.get_platform = lambda: types.SimpleNamespace(is_sm90=is_sm90)
+    runtime_context.get_exec = lambda: types.SimpleNamespace(
+        moe=types.SimpleNamespace(enable_eplb=enable_eplb)
+    )
+
+    @dataclass
+    class Tensors:
+        hidden_states: torch.Tensor
+        topk_ids: torch.Tensor
+        topk_weights: torch.Tensor
+        fc1_alpha: torch.Tensor | None = None
+        fc2_alpha: torch.Tensor | None = None
+        fc1_norm_const: torch.Tensor | None = None
+
+        @property
+        def num_tokens(self):
+            return self.hidden_states.shape[0]
+
+    class Mega:
+        supports_output_view = False
+
+        def __init__(self, **kwargs):
+            self.__dict__.update(kwargs)
+
+        def forward(self, tensors, workspace=None):
+            self.tensors = tensors
+            return tensors.hidden_states
+
+    calls = {}
+
+    def preprocess(weights, *, intermediate_size, hidden_size):
+        calls["preprocess"] = weights
+        calls["legs"] = tuple(
+            tuple(torch.zeros(1, dtype=torch.uint8) for _ in range(4)) for _ in range(2)
+        )
+        return calls["legs"]
+
+    def copy_or_rebind_param(module, name, value):
+        getattr(module, name).data = value
+
+    common = types.ModuleType("sglang.srt.layers.utils.common")
+    common.copy_or_rebind_param = copy_or_rebind_param
+    monkeypatch.setitem(sys.modules, "sglang.srt.layers.utils", types.ModuleType("u"))
+    monkeypatch.setitem(sys.modules, "sglang.srt.layers.utils.common", common)
+
+    fake_moe_ep = types.ModuleType("flashinfer.moe_ep")
+    fake_moe_ep.MoEWeightPack = types.SimpleNamespace
+    fake_moe_ep.preprocess_sm90_pull_mxfp4_mega_weights = preprocess
+    fake_moe_ep.preprocess_mega_weights = lambda weights, **_: (
+        (weights.w13, weights.w13_scale),
+        (weights.w2, weights.w2_scale),
+    )
+    for name in ("Sm90_Fp8_Mxfp4_Bf16_PullCutedsl_MegaMoeConfig", "DeepGemmMegaMoeConfig"):
+        setattr(
+            fake_moe_ep,
+            name,
+            lambda name=name, **kwargs: types.SimpleNamespace(
+                name=name, knobs=None, **kwargs
+            ),
+        )
+    fake_moe_ep.BootstrapConfig = types.SimpleNamespace
+    fake_moe_ep.FleetParams = types.SimpleNamespace
+    fake_moe_ep.MegaConfig = types.SimpleNamespace
+    fake_moe_ep.MoEEpTensors = Tensors
+    fake_moe_ep.MoEEpMegaLayer = Mega
+    monkeypatch.setitem(sys.modules, "flashinfer.moe_ep", fake_moe_ep)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    return calls
+
+
+@pytest.mark.parametrize("is_sm90", [True, False])
+def test_fp4_megamoe_sm90_binds_humming_legs_and_int64_router_ids(
+    monkeypatch, is_sm90
+):
+    """SM90 must hand FlashInfer the four-slot Humming legs, the checkpoint's
+    E8M0 bytes and int64 router ids (its input check rejects int32); SM100 keeps
+    its path."""
+    module = _load_megamoe_module(monkeypatch)
+    calls = _install_fp4_megamoe_fakes(monkeypatch, module, is_sm90=is_sm90)
+    layer = _fp4_expert_layer()
+
+    layer.w13_weight_scale_inv.view(-1)[0] = 2.0**-127
+    module.prepare_fp4_moe_weights_for_flashinfer_megamoe(layer)
+    mega = module.ensure_fp4_moe_layer_for_flashinfer_megamoe(layer)
+    config = mega.backend.megakernel
+    fc1, fc2 = mega.backend.transformed_weights
+    if is_sm90:
+        packed = calls["preprocess"]
+        assert packed.w13.dtype == packed.w2.dtype == torch.uint8
+        # 2**-127 is a float32 subnormal; it must still map to E8M0 byte 0.
+        assert packed.w13_scale.flatten()[:2].tolist() == [0, 126]
+        assert (packed.w2_scale == 129).all()
+        assert config.name == "Sm90_Fp8_Mxfp4_Bf16_PullCutedsl_MegaMoeConfig"
+        assert config.gate_up_clamp == 10.0
+        ptrs = [[t.data_ptr() for t in leg] for leg in (fc1, fc2)]
+        assert ptrs == [[t.data_ptr() for t in leg] for leg in calls["legs"]]
+        assert ptrs[0][:2] == [
+            layer.w13_weight.data_ptr(),
+            layer.w13_weight_scale_inv.data_ptr(),
+        ]
+        assert ptrs[1][:2] == [
+            layer.w2_weight.data_ptr(),
+            layer.w2_weight_scale_inv.data_ptr(),
+        ]
+    else:
+        assert "preprocess" not in calls
+        assert config.name == "DeepGemmMegaMoeConfig"
+        assert len(fc1) == len(fc2) == 2
+
+    topk_ids = torch.tensor([[0, 1]], dtype=torch.int32)
+    module.run_flashinfer_megamoe(
+        types.SimpleNamespace(
+            hidden_states=torch.zeros(1, layer.hidden_size, dtype=torch.bfloat16),
+            topk_output=types.SimpleNamespace(
+                topk_ids=topk_ids,
+                topk_weights=torch.tensor([[0.5, 0.5]], dtype=torch.float32),
+            ),
+        ),
+        module.FlashInferMegaMoeQuantInfo(
+            mega=mega, mega_forward=layer._flashinfer_megamoe_forward
+        ),
+        types.SimpleNamespace(routed_scaling_factor=1.0),
+    )
+    assert mega.tensors.topk_ids.dtype == (torch.int64 if is_sm90 else torch.int32)
+    assert torch.equal(mega.tensors.topk_ids, topk_ids.to(mega.tensors.topk_ids.dtype))
+
+
+@pytest.mark.parametrize(
+    "enable_eplb,router_weight_on_input,match",
+    [(True, False, "EPLB"), (False, True, "routing weights on input")],
+)
+def test_sm90_mxfp4_megamoe_rejects_unsupported_modes_at_load(
+    monkeypatch, enable_eplb, router_weight_on_input, match
+):
+    """EPLB would leave the off-parameter Humming scales behind, and the kernel
+    weights tokens before FC2; both must fail at load, not compute wrong values."""
+    module = _load_megamoe_module(monkeypatch)
+    calls = _install_fp4_megamoe_fakes(
+        monkeypatch, module, is_sm90=True, enable_eplb=enable_eplb
+    )
+    layer = _fp4_expert_layer(apply_router_weight_on_input=router_weight_on_input)
+    with pytest.raises(ValueError, match=match):
+        module.prepare_fp4_moe_weights_for_flashinfer_megamoe(layer)
+    assert "preprocess" not in calls
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

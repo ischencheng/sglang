@@ -25,7 +25,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Callable, Generator
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -245,6 +245,9 @@ def _init_flashinfer_megamoe_layer_state(layer: FusedMoE) -> None:
     layer._flashinfer_megamoe_layer = None
     layer._flashinfer_megamoe_forward = None
     layer._flashinfer_megamoe_input_norm_const = None
+    # SM90 MXFP4 only: ((fc1_placeholder, fc1_scale), (fc2_placeholder, fc2_scale)),
+    # the last two slots of each Humming weight leg.
+    layer._flashinfer_megamoe_humming_scales = None
 
 
 def _get_or_init_flashinfer_megamoe_layer_state(layer: FusedMoE) -> Any:
@@ -260,6 +263,7 @@ def _ensure_flashinfer_megamoe_layer(
     w13_scale: torch.Tensor,
     w2_scale: torch.Tensor,
     with_decode_workspace: bool = False,
+    int64_topk_ids: bool = False,
 ) -> Any:
     mega = _get_or_init_flashinfer_megamoe_layer_state(layer)
     if mega is not None:
@@ -276,6 +280,12 @@ def _ensure_flashinfer_megamoe_layer(
         (layer.w13_weight.data, w13_scale.data),
         (layer.w2_weight.data, w2_scale.data),
     )
+    humming_scales = layer._flashinfer_megamoe_humming_scales
+    if humming_scales is not None:
+        transformed_weights = tuple(
+            leg + extra
+            for leg, extra in zip(transformed_weights, humming_scales, strict=True)
+        )
     world_size, rank = _layer_ep_world_rank(layer)
 
     max_tokens_per_rank = _resolve_max_tokens_per_rank()
@@ -321,7 +331,7 @@ def _ensure_flashinfer_megamoe_layer(
     )
     layer._flashinfer_megamoe_layer = mega
     if hasattr(megakernel_config, "knobs"):
-        layer._flashinfer_megamoe_forward = MegaMoeTunedForward(
+        forward = MegaMoeTunedForward(
             bootstrap,
             fleet_params,
             backend,
@@ -332,14 +342,43 @@ def _ensure_flashinfer_megamoe_layer(
             ),
         )
     else:
-        layer._flashinfer_megamoe_forward = forward_megamoe
+        forward = forward_megamoe
+    if int64_topk_ids:
+        forward = _with_int64_topk_ids(forward)
+    layer._flashinfer_megamoe_forward = forward
     return mega
+
+
+def _with_int64_topk_ids(forward: Callable[[Any, Any], torch.Tensor]):
+    """Widen the int32 router ids for kernels whose input check requires int64."""
+
+    def run(mega: Any, tensors: Any) -> torch.Tensor:
+        return forward(
+            mega, replace(tensors, topk_ids=tensors.topk_ids.to(torch.int64))
+        )
+
+    return run
 
 
 def ensure_fp4_moe_layer_for_flashinfer_megamoe(layer: FusedMoE) -> Any:
     mega = _get_or_init_flashinfer_megamoe_layer_state(layer)
     if mega is not None:
         return mega
+
+    if layer._flashinfer_megamoe_humming_scales is not None:
+        from flashinfer.moe_ep import Sm90_Fp8_Mxfp4_Bf16_PullCutedsl_MegaMoeConfig
+
+        return _ensure_flashinfer_megamoe_layer(
+            layer,
+            megakernel_config=Sm90_Fp8_Mxfp4_Bf16_PullCutedsl_MegaMoeConfig(
+                intermediate_size=layer.intermediate_size_per_partition,
+                top_k=layer.top_k,
+                gate_up_clamp=layer.moe_runner_config.swiglu_limit,
+            ),
+            w13_scale=layer.w13_weight_scale_inv,
+            w2_scale=layer.w2_weight_scale_inv,
+            int64_topk_ids=True,
+        )
 
     from flashinfer.moe_ep import DeepGemmMegaMoeConfig
 
@@ -454,14 +493,20 @@ def prepare_fp4_moe_weights_for_flashinfer_megamoe(
 
     SGLang loads FP4-packed expert weights plus raw block scales. FlashInfer's
     current moe_ep API owns backend-specific weight preprocessing, including
-    DeepGEMM scale layout transforms.
+    DeepGEMM scale layout transforms on SM100 and Humming folding on SM90.
     """
     if (
         not layer.moe_runner_config.is_gated
         or layer.moe_runner_config.activation != "silu"
     ):
-        raise ValueError("FlashInfer DeepGEMM MegaMOE only supports gated SiLU.")
+        raise ValueError("FlashInfer FP4-expert MegaMOE only supports gated SiLU.")
     _init_flashinfer_megamoe_layer_state(layer)
+
+    from sglang.srt.runtime_context import get_platform
+
+    if get_platform().is_sm90:
+        _prepare_sm90_mxfp4_moe_weights(layer)
+        return
 
     from flashinfer.moe_ep import (
         MoEWeightPack,
@@ -485,6 +530,51 @@ def prepare_fp4_moe_weights_for_flashinfer_megamoe(
         w13_scale_name="w13_weight_scale_inv",
         w2_scale_name="w2_weight_scale_inv",
     )
+
+
+def _prepare_sm90_mxfp4_moe_weights(layer: FusedMoE) -> None:
+    if layer.moe_runner_config.apply_router_weight_on_input:
+        raise ValueError(
+            "FlashInfer SM90 MXFP4 MegaMOE applies the routing weights before "
+            "FC2 and does not support routing weights on input."
+        )
+    from sglang.srt.runtime_context import get_exec
+
+    if get_exec().moe.enable_eplb:
+        raise ValueError(
+            "FlashInfer SM90 MXFP4 MegaMOE does not support EPLB: its per-expert "
+            "Humming weight scales are not layer parameters, so EPLB cannot move them."
+        )
+
+    from flashinfer.moe_ep import (
+        MoEWeightPack,
+        preprocess_sm90_pull_mxfp4_mega_weights,
+    )
+
+    # The float32 scale params hold the checkpoint's E8M0 values exactly, so
+    # this cast returns the raw exponent bytes FlashInfer expects.
+    weights = MoEWeightPack(
+        w13=layer.w13_weight.data.view(torch.uint8),
+        w2=layer.w2_weight.data.view(torch.uint8),
+        w13_scale=layer.w13_weight_scale_inv.data.to(torch.float8_e8m0fnu).view(
+            torch.uint8
+        ),
+        w2_scale=layer.w2_weight_scale_inv.data.to(torch.float8_e8m0fnu).view(
+            torch.uint8
+        ),
+    )
+    fc1, fc2 = preprocess_sm90_pull_mxfp4_mega_weights(
+        weights,
+        intermediate_size=layer.intermediate_size_per_partition,
+        hidden_size=layer.hidden_size,
+    )
+    # The packed weights are transposed views with storage-K stride 1. Rebind
+    # instead of copy_or_rebind_param: a same-shape copy would drop that stride.
+    layer.w13_weight.data = fc1[0]
+    layer.w13_weight_scale_inv.data = fc1[1]
+    layer.w2_weight.data = fc2[0]
+    layer.w2_weight_scale_inv.data = fc2[1]
+    layer._flashinfer_megamoe_humming_scales = (fc1[2:], fc2[2:])
 
 
 def make_nvfp4_megamoe_weight_loader(
