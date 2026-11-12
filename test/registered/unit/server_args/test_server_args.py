@@ -2541,6 +2541,15 @@ class TestFlashinferMegaMoeConfig(CustomTestCase):
         with self.assertRaisesRegex(ValueError, "requires an SM100-family"):
             handle_a2a_moe(self._make_args(quantization="fp8", is_fp4_experts=True))
 
+    @patch("sglang.srt.arg_groups.moe_hook.is_sm90_supported", return_value=True)
+    @patch("sglang.srt.arg_groups.moe_hook.is_sm100_supported", return_value=False)
+    def test_megamoe_on_sm90_accepts_only_mxfp4_experts(self, *_):
+        handle_a2a_moe(self._make_args(quantization="fp8", is_fp4_experts=True))
+        for config in ({"quantization": "mxfp8"}, {"quantization": "modelopt_fp4"}):
+            with self.subTest(config=config):
+                with self.assertRaisesRegex(ValueError, "requires an SM100-family"):
+                    handle_a2a_moe(self._make_args(**config))
+
     @patch("sglang.srt.arg_groups.moe_hook.is_sm100_supported", return_value=True)
     def test_megamoe_combine_dtype_accepts_quantized_values(self, _):
         with envs.SGLANG_FLASHINFER_MEGAMOE_COMBINE_DTYPE.override("nvfp4"):

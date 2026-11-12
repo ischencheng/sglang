@@ -34,7 +34,11 @@ from sglang.srt.layers.moe.utils import AscendOpsConfig
 from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
 from sglang.srt.runtime_context import attn_dp_enabled_of, get_platform
 from sglang.srt.utils.common import get_bool_env_var, parse_connector_type
-from sglang.srt.utils.device import is_gfx1250_supported, is_sm100_supported
+from sglang.srt.utils.device import (
+    is_gfx1250_supported,
+    is_sm90_supported,
+    is_sm100_supported,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -430,10 +434,13 @@ def handle_a2a_moe(server_args: Any):
         assert resolved_view(server_args).moe_runner_backend == "flashinfer_megamoe", (
             "FlashInfer MegaMOE a2a backend requires --moe-runner-backend flashinfer_megamoe"
         )
-        if not is_sm100_supported():
+        # SM90 has a MegaMoE kernel only for MXFP4 routed experts.
+        if not is_sm100_supported() and not (
+            is_sm90_supported() and model_config_of(server_args).is_fp4_experts
+        ):
             raise ValueError(
-                "FlashInfer MegaMOE currently requires an SM100-family "
-                "CUDA device for all supported quantization formats."
+                "FlashInfer MegaMOE currently requires an SM100-family CUDA "
+                "device, or SM90 with an MXFP4 routed-expert checkpoint."
             )
         if cfg.nnodes == 1 and (
             cfg.speculative_algorithm is None

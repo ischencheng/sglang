@@ -773,7 +773,8 @@ def run_flashinfer_megamoe(
     t = MoEEpTensors(
         hidden_states=x.to(torch.bfloat16),
         # FlashInfer's fused staging accepts the int32 router output and widens
-        # directly into its final int64 workspace buffer. Keep this path copy-free.
+        # directly into its final int64 workspace buffer. Keep this path copy-free;
+        # only the SM90 MXFP4 forward widens first (_with_int64_topk_ids).
         topk_ids=topk_ids,
         topk_weights=topk_weights.to(torch.float32),
         # Stage per-layer scales on every call so FlashInfer can share its
