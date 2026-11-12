@@ -813,7 +813,9 @@ def _fp4_expert_layer(*, apply_router_weight_on_input=False):
             swiglu_limit=10.0,
             apply_router_weight_on_input=apply_router_weight_on_input,
         ),
-        w13_weight=torch.zeros(experts, 2 * intermediate, hidden // 2, dtype=torch.int8),
+        w13_weight=torch.zeros(
+            experts, 2 * intermediate, hidden // 2, dtype=torch.int8
+        ),
         w2_weight=torch.zeros(experts, hidden, intermediate // 2, dtype=torch.int8),
         w13_weight_scale_inv=torch.full((experts, 2 * intermediate, hidden // 32), 0.5),
         w2_weight_scale_inv=torch.full((experts, hidden, intermediate // 32), 4.0),
@@ -876,7 +878,10 @@ def _install_fp4_megamoe_fakes(monkeypatch, module, *, is_sm90, enable_eplb=Fals
         (weights.w13, weights.w13_scale),
         (weights.w2, weights.w2_scale),
     )
-    for name in ("Sm90_Fp8_Mxfp4_Bf16_PullCutedsl_MegaMoeConfig", "DeepGemmMegaMoeConfig"):
+    for name in (
+        "Sm90_Fp8_Mxfp4_Bf16_PullCutedsl_MegaMoeConfig",
+        "DeepGemmMegaMoeConfig",
+    ):
         setattr(
             fake_moe_ep,
             name,
@@ -896,9 +901,7 @@ def _install_fp4_megamoe_fakes(monkeypatch, module, *, is_sm90, enable_eplb=Fals
 
 
 @pytest.mark.parametrize("is_sm90", [True, False])
-def test_fp4_megamoe_sm90_binds_humming_legs_and_int64_router_ids(
-    monkeypatch, is_sm90
-):
+def test_fp4_megamoe_sm90_binds_humming_legs_and_int64_router_ids(monkeypatch, is_sm90):
     """SM90 must hand FlashInfer the four-slot Humming legs, the checkpoint's
     E8M0 bytes and int64 router ids (its input check rejects int32); SM100 keeps
     its path."""
