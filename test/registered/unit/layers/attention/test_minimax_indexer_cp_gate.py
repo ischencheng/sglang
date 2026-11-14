@@ -3,6 +3,7 @@ import unittest
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.minimax_sparse_ops.indexer_cp import (
     draft_is_chain_layout,
+    loads_all_index_heads,
     unsupported_reason,
 )
 from sglang.srt.speculative.ragged_verify import RaggedVerifyMode
@@ -107,6 +108,22 @@ class TestMiniMaxIndexerCPGate(CustomTestCase):
                     }
                 )
                 self.assertEqual(reason is None, expected, reason)
+
+    def test_all_index_heads_load_only_for_sm90_cp_layers(self):
+        """A replicated projection must never reach an index-value layer, whose
+        idx_o all-reduce sums one head per rank, or a run the CP cannot serve."""
+        on = dict(
+            disable_index_value=True, cp_requested=True, sm90=True, layout=(8, 8, 1, 1)
+        )
+        self.assertTrue(loads_all_index_heads(**on))
+        for change in (
+            {"disable_index_value": False},
+            {"cp_requested": False},
+            {"sm90": False},
+            {"layout": (2, 2, 1, 1)},
+        ):
+            with self.subTest(**change):
+                self.assertFalse(loads_all_index_heads(**{**on, **change}))
 
 
 if __name__ == "__main__":

@@ -30,28 +30,14 @@ MULTIMEM_MAX_ROWS = 128
 _SM90_LAYOUTS = ((4, 4, 1, 1), (8, 8, 1, 1), (8, 4, 1, 2))
 
 
-def loads_all_index_heads(*, disable_index_value: bool) -> bool:
-    """Whether a sparse layer projects every index head on each rank (opt-in CP on SM90).
+def loads_all_index_heads(*, disable_index_value, cp_requested, sm90, layout):
+    """Whether a sparse layer projects every index head on each rank.
 
-    The decode CP scores all heads on every rank, so local queries replace its
-    query all-gather. Index-value layers keep their per-rank head for idx_o.
+    The SM90 decode CP scores all heads on every rank, so local queries replace
+    its query all-gather. Index-value layers keep their per-rank head for idx_o.
+    layout is (tp, attention TP, attention CP, attention DP).
     """
-    from sglang.srt.environ import envs
-    from sglang.srt.runtime_context import get_parallel
-    from sglang.srt.utils import is_hip, is_sm90_supported
-
-    if not disable_index_value or not envs.SGLANG_MINIMAX_M3_INDEXER_CP.get():
-        return False
-    if is_hip() or not is_sm90_supported():
-        return False
-    parallel = get_parallel()
-    layout = (
-        parallel.tp_size,
-        parallel.attn_tp_size,
-        parallel.attn_cp_size,
-        parallel.attn_dp_size,
-    )
-    return layout in _SM90_LAYOUTS
+    return disable_index_value and cp_requested and sm90 and layout in _SM90_LAYOUTS
 
 
 def unsupported_reason(

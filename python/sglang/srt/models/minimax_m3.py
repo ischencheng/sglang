@@ -812,8 +812,17 @@ class MiniMaxM3Attention(nn.Module):
                 "attn_tp", self.idx_replica_size
             )
             # Every index head is projected here; attention reads head idx_head_rank.
+            parallel = get_parallel()
             self.loads_all_index_heads = loads_all_index_heads(
-                disable_index_value=self.disable_index_value
+                disable_index_value=self.disable_index_value,
+                cp_requested=envs.SGLANG_MINIMAX_M3_INDEXER_CP.get(),
+                sm90=_is_cuda and get_platform().is_sm90,
+                layout=(
+                    parallel.tp_size,
+                    attn_tp_size,
+                    parallel.attn_cp_size,
+                    parallel.attn_dp_size,
+                ),
             )
             if self.loads_all_index_heads:
                 self.num_idx_heads = self.total_idx_heads
