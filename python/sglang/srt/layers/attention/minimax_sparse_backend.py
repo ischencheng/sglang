@@ -1739,6 +1739,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         idx_k: torch.Tensor,
         idx_v: Optional[torch.Tensor],
         out_quant: str = "",  # o_proj's fp8_input_quant_format: O may come back as (fp8, scale)
+        idx_q_all_heads: Optional[torch.Tensor] = None,  # [B, all index heads, dim]
         **kwargs,
     ):
         assert len(kwargs) == 0
@@ -1870,6 +1871,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 topk_out=_topk_buf if _want_topk else None,
                 hisparse_swap_in_fn=hisparse_swap_in_fn,
                 indexer_cp=self.indexer_cp,
+                indexer_cp_all_heads_q=idx_q_all_heads,
                 # the verify funnel lays out each request's draft rows consecutively
                 packed_queries=(
                     self.speculative_num_draft_tokens

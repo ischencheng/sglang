@@ -1,7 +1,9 @@
 """On SM90, indexer CP must select exactly the blocks the native page-128 selector does.
 
 Hopper serves the page-128 index cache through its own paged scorer, and at TP8 each
-index head is served by two ranks, so eight shards score four distinct queries.
+index head is served by two ranks, so eight shards score four distinct queries. The
+queries arrive either gathered (one row per rank) or as every rank's local copy of all
+four heads, a strided [heads, batch, dim] view that ranks share head r // (world // 4) of.
 """
 
 import pytest
@@ -51,18 +53,27 @@ def _inputs(batch, max_len, dtype):
     return q, cache, table, slots, lengths
 
 
+def _rank_queries(q, world, all_heads):
+    """The scorer's query operand and its world argument."""
+    if all_heads:
+        return q.transpose(0, 1), {"world": world}
+    head_of_rank = [rank * HEADS // world for rank in range(world)]
+    return q[:, head_of_rank].permute(1, 0, 2).contiguous(), {}
+
+
 @pytest.mark.parametrize("world", [4, 8])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
-def test_sharded_selection_matches_paged_native_selector(world, dtype):
+@pytest.mark.parametrize("all_heads", [False, True])
+def test_sharded_selection_matches_paged_native_selector(world, dtype, all_heads):
     batch, max_len = 4, 32768
     q, cache, table, slots, lengths = _inputs(batch, max_len, dtype)
     head_of_rank = [rank * HEADS // world for rank in range(world)]
-    gathered_q = q[:, head_of_rank].permute(1, 0, 2).contiguous()
+    rank_q, world_arg = _rank_queries(q, world, all_heads)
     keys = torch.stack(
         [
             select_local_candidates(
                 score_local_blocks(
-                    gathered_q,
+                    rank_q,
                     cache,
                     table,
                     slots,
@@ -73,6 +84,7 @@ def test_sharded_selection_matches_paged_native_selector(world, dtype):
                     LOCAL_BLOCKS,
                     DIM**-0.5,
                     1.0,
+                    **world_arg,
                 ),
                 lengths,
                 rank,
@@ -106,7 +118,8 @@ def test_sharded_selection_matches_paged_native_selector(world, dtype):
 
 
 @pytest.mark.parametrize("world", [4, 8])
-def test_chain_verify_rows_match_paged_native_selector(world):
+@pytest.mark.parametrize("all_heads", [False, True])
+def test_chain_verify_rows_match_paged_native_selector(world, all_heads):
     """Verify rows straddle a block boundary; W=4 scores them packed, W=8 row by row."""
     reqs, draft_tokens = 4, 4
     prefix = 255 * BLOCK + 126  # rows end at 32767..32770, across block 256
@@ -115,12 +128,12 @@ def test_chain_verify_rows_match_paged_native_selector(world):
     slots = slots[:reqs].repeat_interleave(draft_tokens)
     lengths = (prefix + torch.arange(1, draft_tokens + 1, device="cuda")).repeat(reqs)
     head_of_rank = [rank * HEADS // world for rank in range(world)]
-    gathered_q = q[:, head_of_rank].permute(1, 0, 2).contiguous()
+    rank_q, world_arg = _rank_queries(q, world, all_heads)
     keys = torch.stack(
         [
             select_local_candidates(
                 score_local_blocks(
-                    gathered_q,
+                    rank_q,
                     cache,
                     table,
                     slots,
@@ -132,6 +145,7 @@ def test_chain_verify_rows_match_paged_native_selector(world):
                     DIM**-0.5,
                     1.0,
                     packed_queries=draft_tokens,
+                    **world_arg,
                 ),
                 lengths,
                 rank,

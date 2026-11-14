@@ -41,6 +41,9 @@ from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_r
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.hf_transformers import get_rope_config
 from sglang.srt.layers.activation import SiluAndMul
+from sglang.srt.layers.attention.minimax_sparse_ops.indexer_cp import (
+    loads_all_index_heads,
+)
 from sglang.srt.layers.aux_hidden_states import (
     AuxHiddenStateAccumulator,
     AuxHiddenStateList,
@@ -808,6 +811,13 @@ class MiniMaxM3Attention(nn.Module):
             index_parallel_group = ReplicatedParallelGroup(
                 "attn_tp", self.idx_replica_size
             )
+            # Every index head is projected here; attention reads head idx_head_rank.
+            self.loads_all_index_heads = loads_all_index_heads(
+                disable_index_value=self.disable_index_value
+            )
+            if self.loads_all_index_heads:
+                self.num_idx_heads = self.total_idx_heads
+                index_parallel_group = "replicated"
 
         self.qkv_proj = QKVParallelLinear(
             self.hidden_size,
@@ -1647,6 +1657,12 @@ class MiniMaxM3Attention(nn.Module):
             if idx_v is not None:
                 idx_v = idx_v.reshape(idx_v.shape[0], 1, self.idx_head_dim)
             extra = _hip.sparse_attn_kwargs(self, forward_batch, q) if _is_hip else {}
+            if self.loads_all_index_heads:
+                if forward_batch.forward_mode.is_decode():
+                    extra["idx_q_all_heads"] = idx_q
+                # A strided view: the SM90 index scorers take q strides.
+                head = self.idx_head_rank
+                idx_q = idx_q[:, head : head + 1]
             idx_o, attn_output = self.attn(
                 q, k, v, forward_batch, idx_q=idx_q, idx_k=idx_k, idx_v=idx_v, **extra
             )

@@ -28,6 +28,7 @@ def _score_shard(
     LOCAL_BLOCKS: tl.constexpr,
     Q_HEAD_STRIDE: tl.constexpr,
     Q_ROW_STRIDE: tl.constexpr,
+    Q_HEAD_SHARE: tl.constexpr,
     K_SLOT_STRIDE: tl.constexpr,
     K_DIM_STRIDE: tl.constexpr,
     TABLE_STRIDE: tl.constexpr,
@@ -51,7 +52,10 @@ def _score_shard(
     num_blocks = tl.cdiv(length, 128)
     local_start = tl.maximum(0, num_blocks - LOCAL_KEEP)
     q = tl.load(
-        Q + heads[:, None] * Q_HEAD_STRIDE + row * Q_ROW_STRIDE + dims[None, :],
+        Q
+        + (heads[:, None] // Q_HEAD_SHARE) * Q_HEAD_STRIDE
+        + row * Q_ROW_STRIDE
+        + dims[None, :],
         mask=heads[:, None] < WORLD,
         other=0,
     )
@@ -112,6 +116,7 @@ def _score_shard_packed(
     LOCAL_BLOCKS: tl.constexpr,
     Q_HEAD_STRIDE: tl.constexpr,
     Q_ROW_STRIDE: tl.constexpr,
+    Q_HEAD_SHARE: tl.constexpr,
     K_SLOT_STRIDE: tl.constexpr,
     K_DIM_STRIDE: tl.constexpr,
     TABLE_STRIDE: tl.constexpr,
@@ -142,7 +147,7 @@ def _score_shard_packed(
     local_start = tl.maximum(0, num_blocks - LOCAL_KEEP)
     q = tl.load(
         Q
-        + head[:, None] * Q_HEAD_STRIDE
+        + (head[:, None] // Q_HEAD_SHARE) * Q_HEAD_STRIDE
         + rows[:, None] * Q_ROW_STRIDE
         + dims[None, :],
         mask=in_tile[:, None],
@@ -290,13 +295,18 @@ def score_local_blocks(
     sm_scale,
     k_scale,
     packed_queries=1,
+    world=None,
 ):
-    """Score [world,batch,128] queries through SGLang's token-slot mapping.
+    """Score [heads,batch,128] queries through SGLang's token-slot mapping.
 
+    Rank r scores with head r // (world // heads); world defaults to heads.
     With packed_queries > 1, each group of that many consecutive rows belongs to one request
     and reads each K block once for the whole group.
     """
-    world, batch, _ = gathered_q.shape
+    heads, batch, _ = gathered_q.shape
+    world = heads if world is None else world
+    if world % heads:
+        raise ValueError(f"{heads} query heads cannot serve {world} ranks")
     blocks = triton.cdiv(max_seqlen, 128)
     local = triton.cdiv(blocks, world)
     scores = torch.empty(
@@ -325,6 +335,7 @@ def score_local_blocks(
             LOCAL_BLOCKS=local,
             Q_HEAD_STRIDE=gathered_q.stride(0),
             Q_ROW_STRIDE=gathered_q.stride(1),
+            Q_HEAD_SHARE=world // heads,
             K_SLOT_STRIDE=k_cache.stride(0),
             K_DIM_STRIDE=k_cache.stride(2),
             TABLE_STRIDE=req_to_token.stride(0),
@@ -355,6 +366,7 @@ def score_local_blocks(
             LOCAL_BLOCKS=local,
             Q_HEAD_STRIDE=gathered_q.stride(0),
             Q_ROW_STRIDE=gathered_q.stride(1),
+            Q_HEAD_SHARE=world // heads,
             K_SLOT_STRIDE=k_cache.stride(0),
             K_DIM_STRIDE=k_cache.stride(2),
             TABLE_STRIDE=req_to_token.stride(0),

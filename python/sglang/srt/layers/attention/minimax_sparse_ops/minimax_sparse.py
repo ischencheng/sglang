@@ -351,6 +351,7 @@ def minimax_sparse_decode(
     topk_out: Optional[torch.Tensor] = None,
     hisparse_swap_in_fn: Optional[Callable] = None,
     indexer_cp=None,
+    indexer_cp_all_heads_q: Optional[torch.Tensor] = None,
     packed_queries: int = 1,  # consecutive rows sharing one request (EAGLE verify)
     verify_num_draft: Optional[int] = None,  # rows = reqs x num_draft, one slot per req
     # The o_proj's fp8_input_quant_format: O may come back as (fp8, scale) for it.
@@ -407,6 +408,7 @@ def minimax_sparse_decode(
             idx_q_scale,
             idx_k_scale,
             packed_queries=packed_queries,
+            all_heads_q=indexer_cp_all_heads_q,
         )
         _skip_reduce = True
     elif (

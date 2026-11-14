@@ -24,6 +24,36 @@ CP_MIN_VERIFY_REQS = 12
 MULTIMEM_MAX_ROWS = 128
 
 
+# (tp, attention TP, attention CP, attention DP). At TP8 each rank still serves one
+# index head; head pairs are replicated. Under attention DP the CP group is one
+# replica's attention TP group.
+_SM90_LAYOUTS = ((4, 4, 1, 1), (8, 8, 1, 1), (8, 4, 1, 2))
+
+
+def loads_all_index_heads(*, disable_index_value: bool) -> bool:
+    """Whether a sparse layer projects every index head on each rank (opt-in CP on SM90).
+
+    The decode CP scores all heads on every rank, so local queries replace its
+    query all-gather. Index-value layers keep their per-rank head for idx_o.
+    """
+    from sglang.srt.environ import envs
+    from sglang.srt.runtime_context import get_parallel
+    from sglang.srt.utils import is_hip, is_sm90_supported
+
+    if not disable_index_value or not envs.SGLANG_MINIMAX_M3_INDEXER_CP.get():
+        return False
+    if is_hip() or not is_sm90_supported():
+        return False
+    parallel = get_parallel()
+    layout = (
+        parallel.tp_size,
+        parallel.attn_tp_size,
+        parallel.attn_cp_size,
+        parallel.attn_dp_size,
+    )
+    return layout in _SM90_LAYOUTS
+
+
 def unsupported_reason(
     *,
     gfx950,
@@ -51,13 +81,7 @@ def unsupported_reason(
         if (tp_size, attn_tp_size, attn_cp_size, attn_dp_size) != (4, 4, 1, 1):
             return "requires TP4 with attention CP/DP size 1"
     elif sm90:
-        # At TP8 each rank still serves one index head; head pairs are replicated.
-        # Under attention DP the CP group is one replica's attention TP group.
-        if (tp_size, attn_tp_size, attn_cp_size, attn_dp_size) not in (
-            (4, 4, 1, 1),
-            (8, 8, 1, 1),
-            (8, 4, 1, 2),
-        ):
+        if (tp_size, attn_tp_size, attn_cp_size, attn_dp_size) not in _SM90_LAYOUTS:
             return (
                 "requires TP4, TP8, or TP8 with attention DP2, and attention CP size 1"
             )
@@ -260,6 +284,19 @@ class MiniMaxIndexerCP:
             in (q.dtype, torch.float8_e4m3fn, torch.float8_e4m3fnuz, torch.float8_e5m2)
         )
 
+    def _gather_queries(self, local_q, multimem):
+        """[world, batch, 128]: every rank's own index-head query."""
+        batch = local_q.shape[0]
+        # The offset of q in its allocation is shape-determined, so this agrees across ranks.
+        if multimem and local_q.data_ptr() % 16 == 0:
+            gathered_q = _multimem_all_gather(self.multimem[0], local_q)
+        else:
+            gathered_q = torch.empty(
+                (self.world * batch, 128), dtype=local_q.dtype, device=local_q.device
+            )
+            self.group.all_gather_into_tensor(gathered_q, local_q)
+        return gathered_q.view(self.world, batch, 128)
+
     def __call__(
         self,
         q,
@@ -274,7 +311,9 @@ class MiniMaxIndexerCP:
         q_scale=None,
         k_scale=None,
         packed_queries=1,
+        all_heads_q=None,
     ):
+        """all_heads_q: [batch, heads, 128] when this rank computed every index head."""
         from sglang.kernels.ops.attention.minimax_sparse.common.nvfp4 import (
             Nvfp4Cache,
         )
@@ -291,20 +330,16 @@ class MiniMaxIndexerCP:
         batch = q.shape[0]
         if batch == 0:
             return torch.empty((1, 0, 16), dtype=torch.int32, device=q.device)
-        local_q = q[:, 0].contiguous()
         world = self.world
         multimem = self.multimem is not None and batch <= MULTIMEM_MAX_ROWS
-        # The offset of q in its allocation is shape-determined, so this agrees across ranks.
-        if multimem and local_q.data_ptr() % 16 == 0:
-            gathered_q = _multimem_all_gather(self.multimem[0], local_q)
+        nvfp4 = isinstance(k_cache, Nvfp4Cache)
+        if all_heads_q is not None and not nvfp4:
+            # [heads, batch, 128] view; the scorer maps rank r to head r // (world // heads)
+            q_heads = all_heads_q.transpose(0, 1)
         else:
-            gathered_q = torch.empty(
-                (world * batch, 128), dtype=q.dtype, device=q.device
-            )
-            self.group.all_gather_into_tensor(gathered_q, local_q)
-        q_heads = gathered_q.view(world, batch, 128)
+            q_heads = self._gather_queries(q[:, 0].contiguous(), multimem)
         sm_scale = 128**-0.5 if sm_scale is None else sm_scale
-        if isinstance(k_cache, Nvfp4Cache):
+        if nvfp4:
             # sm_scale folds q and k scales as verify_topk_idx does, so the ids match it
             return cp_verify_exchange(
                 q_heads=q_heads,
@@ -335,6 +370,7 @@ class MiniMaxIndexerCP:
             sm_scale,
             1.0 if k_scale is None else k_scale,
             packed_queries=packed_queries,
+            world=world,
         )
         keys = select_local_candidates(scores, seq_lens, self.rank, max_seqlen)
         if multimem:
