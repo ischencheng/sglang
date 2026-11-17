@@ -289,6 +289,43 @@ def test_hopper_compensated_mhc(num_tokens):
         assert layer._hc_attn_bf16_parts is None
 
 
+@pytest.mark.parametrize("num_tokens", [32, 128, 129, 256])
+def test_hopper_mhc_decode_grid(num_tokens):
+    """Hopper runs an inline mix on the 64x64 grid only while it fits one wave,
+    and those results stay bitwise repeatable; the stats-stream mix keeps 16 slices."""
+    from unittest.mock import patch
+
+    from sglang.srt.environ import envs
+    from sglang.srt.models import deepseek_v4_mhc as model_mhc
+    from sglang.srt.models.deepseek_v4 import DeepseekV4DecoderLayer
+    from sglang.srt.utils import is_sm90_supported
+
+    if not is_sm90_supported():
+        pytest.skip("Hopper compensated mHC dispatch")
+    x, w, scale, base = _mhc_mix_inputs(num_tokens)
+    norm = SimpleNamespace(weight=torch.ones(5120, device="cuda", dtype=torch.bfloat16))
+    layer = _hopper_mhc_layer(norm, w, scale, base)
+    launch = mhc.hc_mix_stats_sinkhorn_bf16x3
+    grids = []
+
+    def record(*args, decode_grid=False, **kwargs):
+        grids.append(decode_grid)
+        return launch(*args, decode_grid=decode_grid, **kwargs)
+
+    with (
+        envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.override(True),
+        patch.object(mhc, "hc_mix_stats_sinkhorn_bf16x3", side_effect=record),
+    ):
+        DeepseekV4DecoderLayer.refresh_mhc_norm_weight_cache(layer)
+        runs = [model_mhc.mix_stats(layer.attn_hc, x) for _ in range(10)]
+        model_mhc.mix_stats(layer.attn_hc, x, torch.cuda.Stream())
+        torch.cuda.synchronize()
+    sms = mhc.current_arch().num_sms
+    assert grids == [-(-num_tokens // 64) * 64 <= sms] * 10 + [False]
+    for run in runs[1:]:
+        assert all(torch.equal(a, b) for a, b in zip(runs[0], run))
+
+
 @pytest.mark.parametrize("num_tokens", [32, 100, 256, 512, 1024])
 def test_deepgemm_prenorm_dual_matches_two_calls(num_tokens):
     from unittest.mock import patch

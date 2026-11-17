@@ -2616,6 +2616,17 @@ def _hc_mix_deepgemm_slices(m: int) -> int:
     return _HC_MIX_COMPENSATED_SLICES // 2
 
 
+# Rows per CTA and K slices of the bf16x3 decode grid.
+_HC_MIX_DECODE_GRID = 64
+
+
+def hc_mix_decode_grid_fits_one_wave(m: int) -> bool:
+    # Measured on H200: with two of these 3-stage CTAs on one SM, the partials
+    # differ from run to run, so Hopper takes the decode grid only within a wave.
+    grid_m = triton.cdiv(m, _HC_MIX_DECODE_GRID)
+    return grid_m * _HC_MIX_DECODE_GRID <= current_arch().num_sms
+
+
 def split_bf16_hc_weight(weight: torch.Tensor):
     assert weight.dtype == torch.float32 and weight.is_contiguous()
     high = weight.bfloat16()
@@ -2694,7 +2705,7 @@ def hc_mix_stats_sinkhorn_bf16x3(
     mix = (2 + hc_mult) * hc_mult
     hopper_medium = get_platform().is_sm90 and 32 <= m < 4096
     if decode_grid:
-        slices, block_m = 64, 64
+        slices = block_m = _HC_MIX_DECODE_GRID
     else:
         slices = _HC_MIX_COMPENSATED_SLICES
         block_m = 64 if hopper_medium else _HC_MIX_BF16X3_BLOCK_M

@@ -352,14 +352,17 @@ def mix_stats(
     main_stream = torch.cuda.current_stream()
     x.record_stream(stats_stream)
     with torch.cuda.stream(stats_stream):
-        coefficients = _mix_stats_impl(hc, x)
+        coefficients = _mix_stats_impl(hc, x, on_stats_stream=True)
     for coefficient in coefficients:
         coefficient.record_stream(main_stream)
     return coefficients
 
 
-def _mix_stats_impl(hc: HcSubLayer, x: torch.Tensor) -> HcTriplet:
+def _mix_stats_impl(
+    hc: HcSubLayer, x: torch.Tensor, on_stats_stream: bool = False
+) -> HcTriplet:
     from sglang.kernels.ops.layernorm.mhc import (
+        hc_mix_decode_grid_fits_one_wave,
         hc_mix_stats,
         hc_mix_stats_sinkhorn,
         hc_split_sinkhorn,
@@ -387,11 +390,19 @@ def _mix_stats_impl(hc: HcSubLayer, x: torch.Tensor) -> HcTriplet:
     ):
         parts, bf16_parts = hc.tf32_parts, hc.bf16_parts
 
-    bf16_decode_grid = (
-        bf16_parts is not None
-        and get_platform().is_sm100
-        and get_platform().device_sm != 107
-        and x_flat.shape[0] <= 256
+    bf16_decode_grid = bf16_parts is not None and (
+        (
+            get_platform().is_sm100
+            and get_platform().device_sm != 107
+            and x_flat.shape[0] <= 256
+        )
+        # Beside a full-grid sublayer kernel the 16-slice launch hides better,
+        # so the Hopper stats-stream mix keeps it.
+        or (
+            get_platform().is_sm90
+            and not on_stats_stream
+            and hc_mix_decode_grid_fits_one_wave(x_flat.shape[0])
+        )
     )
     use_bf16_projection = bf16_parts is not None and (
         hopper_medium or bf16_decode_grid or 4096 <= x_flat.shape[0] <= 65536
