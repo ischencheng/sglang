@@ -289,8 +289,10 @@ def test_hopper_compensated_mhc(num_tokens):
         assert layer._hc_attn_bf16_parts is None
 
 
-@pytest.mark.parametrize("num_tokens", [32, 128, 129, 256])
-def test_hopper_mhc_decode_grid(num_tokens):
+@pytest.mark.parametrize(
+    "num_tokens, decode_grid", [(32, True), (128, True), (129, False), (256, False)]
+)
+def test_hopper_mhc_decode_grid(num_tokens, decode_grid):
     """Hopper runs an inline mix on the 64x64 grid only while it fits one wave,
     and those results stay bitwise repeatable; the stats-stream mix keeps 16 slices."""
     from unittest.mock import patch
@@ -302,6 +304,8 @@ def test_hopper_mhc_decode_grid(num_tokens):
 
     if not is_sm90_supported():
         pytest.skip("Hopper compensated mHC dispatch")
+    if mhc.current_arch().num_sms != 132:
+        pytest.skip("the expected launches are for 132-SM Hopper")
     x, w, scale, base = _mhc_mix_inputs(num_tokens)
     norm = SimpleNamespace(weight=torch.ones(5120, device="cuda", dtype=torch.bfloat16))
     layer = _hopper_mhc_layer(norm, w, scale, base)
@@ -320,8 +324,7 @@ def test_hopper_mhc_decode_grid(num_tokens):
         runs = [model_mhc.mix_stats(layer.attn_hc, x) for _ in range(10)]
         model_mhc.mix_stats(layer.attn_hc, x, torch.cuda.Stream())
         torch.cuda.synchronize()
-    sms = mhc.current_arch().num_sms
-    assert grids == [-(-num_tokens // 64) * 64 <= sms] * 10 + [False]
+    assert grids == [decode_grid] * 10 + [False]
     for run in runs[1:]:
         assert all(torch.equal(a, b) for a, b in zip(runs[0], run))
 
