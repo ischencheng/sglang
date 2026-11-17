@@ -441,7 +441,9 @@ def test_hopper_mhc_stats_stream_graph(num_tokens):
         # Read on the consumer stream after the join, as hc_post does.
         return combined.clone(), *(v.clone() for v in coefficients)
 
-    run(None)
+    # The reference runs the stats-stream launch with no second stream to join.
+    one_stream = torch.cuda.current_stream()
+    run(one_stream)
     run(stream)
     torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()
@@ -450,7 +452,7 @@ def test_hopper_mhc_stats_stream_graph(num_tokens):
     for _ in range(3):
         x.normal_()
         pre.uniform_()
-        expected = run(None)
+        expected = run(one_stream)
         graph.replay()
         for result, reference in zip(actual, expected):
             torch.testing.assert_close(result, reference, rtol=0, atol=0)
