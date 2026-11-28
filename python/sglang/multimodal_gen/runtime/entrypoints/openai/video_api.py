@@ -252,6 +252,7 @@ def _build_video_sampling_params(request_id: str, request: VideoGenerationsReque
         "task_type": request.task_type,
         "request_data_type": DataType.VIDEO,
         "num_outputs_per_prompt": max(1, min(int(num_outputs), 10)),
+        "allow_dynamic_batching": request.allow_dynamic_batching,
         "size": request.size,
         "width": request.width,
         "height": request.height,
@@ -372,11 +373,9 @@ async def _dispatch_job_async(
                     os.remove(output_path)
                 except FileNotFoundError:
                     pass
-                except OSError:
+                except OSError as exc:
                     logger.warning(
-                        "Failed to remove rejected video output %s",
-                        output_path,
-                        exc_info=True,
+                        "Failed to remove rejected video output (errno=%s)", exc.errno
                     )
             raise
 
@@ -418,14 +417,14 @@ async def _dispatch_job_async(
     except Exception as e:
         if await VIDEO_STORE.get(job_id) is None:
             # DELETE removed the job and stopped its generation
-            logger.info("Video job %s was deleted: %s", job_id, e)
+            logger.info("Video job %s was deleted", job_id)
             return
-        logger.exception("Video job %s failed", job_id)
+        logger.error("Video job %s failed (%s)", job_id, type(e).__name__)
         await VIDEO_STORE.update_fields(
             job_id,
             {
                 "status": "failed",
-                "error": {"message": str(e)},
+                "error": {"message": "Video generation failed"},
                 "url": None,
                 "urls": None,
                 "file_path": None,
@@ -453,6 +452,7 @@ async def create_video(
     task_type: Optional[str] = Form(None),
     n: Optional[int] = Form(1),
     num_outputs_per_prompt: Optional[int] = Form(None),
+    allow_dynamic_batching: Optional[bool] = Form(None),
     seconds: Optional[int] = Form(None),
     size: Optional[str] = Form(None),
     fps: Optional[int] = Form(None),
@@ -519,7 +519,6 @@ async def create_video(
                         video_reference,
                         request_id,
                         uploads_dir,
-                        prefer_remote_source=server_args.input_save_path is None,
                     )
                 elif video_path or video_url:
                     video_input_path = video_path or video_url
@@ -530,7 +529,6 @@ async def create_video(
                         input_reference,
                         request_id,
                         uploads_dir,
-                        prefer_remote_source=server_args.input_save_path is None,
                     )
                     image_sources = merge_image_input_list(reference_url)
                 elif reference_url and _is_probably_video_source(reference_url):
@@ -544,7 +542,6 @@ async def create_video(
                             image_sources,
                             request_id,
                             uploads_dir,
-                            prefer_remote_source=server_args.input_save_path is None,
                         )
                     except Exception as e:
                         raise HTTPException(
@@ -590,6 +587,9 @@ async def create_video(
                     model=form_value("model", model),
                     task_type=form_text_value("task_type", task_type),
                     n=form_value("n", n),
+                    allow_dynamic_batching=form_value(
+                        "allow_dynamic_batching", allow_dynamic_batching
+                    ),
                     num_outputs_per_prompt=form_value(
                         "num_outputs_per_prompt", num_outputs_per_prompt
                     ),
@@ -679,8 +679,6 @@ async def create_video(
                                 payload.get("reference_url"),
                                 request_id,
                                 uploads_dir,
-                                prefer_remote_source=server_args.input_save_path
-                                is None,
                             )
                         except Exception as e:
                             raise HTTPException(
@@ -701,7 +699,6 @@ async def create_video(
             req.output_path = resources.enter_context(
                 temp_dir_if_disabled(effective_output_path)
             )
-            logger.debug(f"Server received from create_video endpoint: req={req}")
 
             image_path = _resolve_image_path(req, _resolve_video_path(req))
             req.prompt = await maybe_enhance_prompt(
@@ -849,6 +846,9 @@ async def download_video_content(
     if not job:
         raise HTTPException(status_code=404, detail="Video not found")
 
+    if job.get("status") != "completed":
+        raise HTTPException(status_code=404, detail="Video output is not available")
+
     cloud_url = select_output_variant(job, variant, "urls", "url")
     if cloud_url:
         raise HTTPException(
@@ -859,8 +859,6 @@ async def download_video_content(
     file_path = _select_lidar_artifact_path(job, variant) or select_output_variant(
         job, variant, "file_paths", "file_path"
     )
-    if job.get("status") not in {"completed", "failed"}:
-        raise HTTPException(status_code=404, detail="Generation is still in-progress")
     if not file_path or not os.path.exists(file_path):
         raise HTTPException(
             status_code=404, detail=f"Video variant {variant} not found"

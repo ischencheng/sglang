@@ -15,14 +15,12 @@
 
 import io
 import logging
+from typing import BinaryIO
 
 import numpy as np
 
 logger = logging.getLogger(__name__)
 
-_INVALID_AUDIO_CONTAINER_MESSAGE = (
-    "Invalid input_audio: no decodable audio stream was found in the media container."
-)
 _AUDIO_CONTAINER_SIGNATURES = (
     ((4, b"ftyp"),),
     ((0, b"RIFF"), (8, b"AVI ")),
@@ -33,8 +31,13 @@ _AUDIO_CONTAINER_SIGNATURES = (
 )
 
 
-class _AudioContainerDecodeError(ValueError):
-    pass
+class AudioContainerDecodeError(ValueError):
+    """A public diagnostic that never contains codec output or media contents."""
+
+    def __init__(self):
+        super().__init__(
+            "Invalid input_audio: no decodable audio stream was found in the media container."
+        )
 
 
 def is_audio_container(data: bytes) -> bool:
@@ -57,24 +60,33 @@ def _append_resampled_frames(
 
 
 def decode_audio_container(
-    source: bytes | str,
+    source: bytes | str | BinaryIO,
     *,
     target_sr: int,
     mono: bool,
 ) -> np.ndarray:
     """Strictly decode the first audio stream from a supported container."""
     if not isinstance(target_sr, int) or target_sr <= 0:
-        raise ValueError(_INVALID_AUDIO_CONTAINER_MESSAGE)
+        raise AudioContainerDecodeError()
     if isinstance(source, bytes) and not source:
-        raise ValueError(_INVALID_AUDIO_CONTAINER_MESSAGE)
+        raise AudioContainerDecodeError()
+    if isinstance(source, str) and source.startswith(("http://", "https://")):
+        from sglang.srt.multimodal.media_io import (
+            download_remote_media,
+            media_url_timeout,
+        )
+
+        source = download_remote_media(source, timeout=media_url_timeout(5))
 
     try:
         import av
 
         input_source = io.BytesIO(source) if isinstance(source, bytes) else source
-        with av.open(input_source) as container:
+        # Client bytes must not make a demuxer fetch the URLs a playlist names.
+        options = {} if isinstance(source, str) else {"protocol_whitelist": "data"}
+        with av.open(input_source, options=options) as container:
             if not container.streams.audio:
-                raise _AudioContainerDecodeError(_INVALID_AUDIO_CONTAINER_MESSAGE)
+                raise AudioContainerDecodeError()
 
             audio_stream = container.streams.audio[0]
             if mono:
@@ -115,20 +127,20 @@ def decode_audio_container(
                     len(chunks),
                     first_decode_error,
                 )
-    except _AudioContainerDecodeError:
+    except AudioContainerDecodeError:
         raise
     except Exception as error:
-        raise ValueError(_INVALID_AUDIO_CONTAINER_MESSAGE) from error
+        raise AudioContainerDecodeError() from error
 
     if not chunks:
         if first_decode_error is not None:
-            raise ValueError(_INVALID_AUDIO_CONTAINER_MESSAGE) from first_decode_error
-        raise ValueError(_INVALID_AUDIO_CONTAINER_MESSAGE)
+            raise AudioContainerDecodeError() from first_decode_error
+        raise AudioContainerDecodeError()
 
     waveform = np.concatenate(chunks, axis=0)
     expected_ndim = 1 if mono else 2
     if waveform.ndim != expected_ndim or waveform.size == 0:
-        raise ValueError(_INVALID_AUDIO_CONTAINER_MESSAGE)
+        raise AudioContainerDecodeError()
     return np.ascontiguousarray(waveform, dtype=np.float32)
 
 

@@ -87,6 +87,7 @@ from sglang.multimodal_gen.runtime.post_training.scheduler_post_training_mixin i
 from sglang.multimodal_gen.runtime.server_args import (
     PortArgs,
     ServerArgs,
+    configure_media_url_policy,
     set_global_server_args,
 )
 from sglang.multimodal_gen.runtime.server_warmup import (
@@ -160,6 +161,7 @@ class Scheduler(
             local_rank = gpu_id
 
         set_global_server_args(server_args=server_args)
+        configure_media_url_policy(server_args)
 
         # Each DP replica is a contiguous rank block (dp is the outermost
         # layout axis); its first rank binds the replica's ingress, and the
@@ -676,6 +678,8 @@ class Scheduler(
         return tuple(signature_items)
 
     def _get_cached_signature(self, req: Req) -> tuple[Any, ...] | None:
+        if not req.allows_dynamic_batching(self.server_args.batching_mode):
+            return None
         cached = getattr(req, "_dynamic_batch_sig", None)
         if cached is not None:
             return cached
@@ -740,6 +744,12 @@ class Scheduler(
 
         if base_req.is_warmup or candidate_req.is_warmup:
             return "warmup"
+        if any(
+            req.sampling_params is not None
+            and not req.allows_dynamic_batching(self.server_args.batching_mode)
+            for req in (base_req, candidate_req)
+        ):
+            return "request_batching_disabled"
         if self._requires_sequential_multi_output(base_req, candidate_req):
             return "sequential_multi_output"
         if not self._pipeline_supports_dynamic_batching_for_request(
@@ -805,7 +815,6 @@ class Scheduler(
         """Return whether `candidate_req` can be merged into a batch with `base_req`."""
         if base_req.is_warmup or candidate_req.is_warmup:
             return False
-
         if self._requires_sequential_multi_output(base_req, candidate_req):
             return False
 
@@ -1559,6 +1568,13 @@ class Scheduler(
         The main event loop that listens for ZMQ requests.
         Handles abortion
         """
+        if self.server_args.stage_role:
+            from sglang.multimodal_gen.runtime.disaggregation.deployment.worker import (
+                run_stage_worker,
+            )
+
+            return run_stage_worker(self)
+
         # Pool mode: all roles use the pool event loop
         if self._disagg_role != RoleType.MONOLITHIC:
             self._disagg_event_loop()

@@ -969,7 +969,9 @@ def test_merged_batch_is_cancellable_only_when_each_member_is(
 def test_queued_cancel_is_filtered_before_dynamic_batch(cancel_state, cancelled):
     scheduler = object.__new__(Scheduler)
     scheduler._async_output_save = False
-    scheduler.server_args = SimpleNamespace(pipeline_config=WanT2V480PConfig())
+    scheduler.server_args = SimpleNamespace(
+        pipeline_config=WanT2V480PConfig(), batching_mode="dynamic"
+    )
     scheduler._batching_max_size = 3
     scheduler._batching_delay_s = 0
     reqs = [_req(name) for name in ("a", "b", "c")]
@@ -1093,6 +1095,9 @@ def test_lifespan_starts_and_stops_the_cancel_publisher(monkeypatch):
         probe.unbind(probe.last_endpoint)
     args = SimpleNamespace(
         enable_metrics=False,
+        media_gateway_key_file=None,
+        api_key=None,
+        admin_api_key=None,
         warmup_mode="off",
         progress_endpoint=None,
         cancel_endpoint="ipc:///tmp/sglang-cancel-lifespan",
